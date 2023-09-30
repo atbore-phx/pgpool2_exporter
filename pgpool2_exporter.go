@@ -28,9 +28,9 @@ import (
 	"fmt"
 	"math"
 	"net/url"
-	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -132,9 +132,8 @@ type MetricMapNamespace struct {
 // Stores the prometheus metric description which a given column will be mapped
 // to by the collector
 type MetricMap struct {
-	discard    bool                 // Should metric be discarded during mapping?
-	vtype      prometheus.ValueType // Prometheus valuetype
-	namespace  string
+	discard    bool                              // Should metric be discarded during mapping?
+	vtype      prometheus.ValueType              // Prometheus valuetype
 	desc       *prometheus.Desc                  // Prometheus descriptor
 	conversion func(interface{}) (float64, bool) // Conversion function to turn PG result into float64
 }
@@ -161,28 +160,21 @@ type Exporter struct {
 
 var (
 	metricMaps = map[string]map[string]ColumnMapping{
-		"pool_nodes": {
+		"pool_backend_stats": {
 			"hostname":          {LABEL, "Backend hostname"},
 			"port":              {LABEL, "Backend port"},
 			"role":              {LABEL, "Role (primary or standby)"},
 			"status":            {GAUGE, "Backend node Status (1 for up or waiting, 0 for down or unused)"},
 			"select_cnt":        {COUNTER, "SELECT statement counts issued to each backend"},
+			"insert_cnt":        {COUNTER, "INSERT statement counts issued to each backend"},
+			"update_cnt":        {COUNTER, "UPDATE statement counts issued to each backend"},
+			"delete_cnt":        {COUNTER, "DELETE statement counts issued to each backend"},
+			"ddl_cnt":           {COUNTER, "DDL statement counts issued to each backend"},
+			"other_cnt":         {COUNTER, "other statement counts issued to each backend"},
+			"panic_cnt":         {COUNTER, "Panic message counts returned from backend"},
+			"fatal_cnt":         {COUNTER, "Fatal message counts returned from backend)"},
+			"error_cnt":         {COUNTER, "Error message counts returned from backend"},
 			"replication_delay": {GAUGE, "Replication delay"},
-		},
-		"pool_backend_stats": {
-			"hostname":   {LABEL, "Backend hostname"},
-			"port":       {LABEL, "Backend port"},
-			"role":       {LABEL, "Role (primary or standby)"},
-			"status":     {GAUGE, "Backend node Status (1 for up or waiting, 0 for down or unused)"},
-			"select_cnt": {COUNTER, "SELECT statement counts issued to each backend"},
-			"insert_cnt": {COUNTER, "INSERT statement counts issued to each backend"},
-			"update_cnt": {COUNTER, "UPDATE statement counts issued to each backend"},
-			"delete_cnt": {COUNTER, "DELETE statement counts issued to each backend"},
-			"ddl_cnt":    {COUNTER, "DDL statement counts issued to each backend"},
-			"other_cnt":  {COUNTER, "other statement counts issued to each backend"},
-			"panic_cnt":  {COUNTER, "Panic message counts returned from backend"},
-			"fatal_cnt":  {COUNTER, "Fatal message counts returned from backend)"},
-			"error_cnt":  {COUNTER, "Error message counts returned from backend"},
 		},
 		"pool_health_check_stats": {
 			"hostname":            {LABEL, "Backend hostname"},
@@ -270,6 +262,42 @@ func NewExporter(dsn string, namespace string) *Exporter {
 	}
 }
 
+func calcReplicationDelay(db *sql.DB, namespace string) (map[string]float64, error) {
+	query := "SELECT client_addr,replay_lag FROM pg_stat_replication;"
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, errors.New(fmt.Sprintln("Error running query on database: ", namespace, err))
+	}
+	defer rows.Close()
+
+	delay := make(map[string]float64)
+	for rows.Next() {
+		var address string
+		var replicationDelay string
+		err := rows.Scan(&address, &replicationDelay)
+		if err != nil {
+			return nil, errors.New(fmt.Sprintln("Error scanning rows: ", namespace, err))
+		}
+
+		parts := strings.Split(replicationDelay, ":")
+		subParts := strings.Split(parts[2], ".")
+		parts[2] = subParts[0]
+		parts = append(parts, subParts[1])
+		var msTotal float64
+		for i, part := range parts {
+			multiplier := [4]float64{3600000, 60000, 1000, 0.001}[i]
+			duration, _ := strconv.ParseFloat(part, 64)
+			msTotal += duration * multiplier
+		}
+
+		delay[address] = msTotal
+	}
+	if err := rows.Err(); err != nil {
+		return nil, errors.New(fmt.Sprintln("Error iterating rows: ", namespace, err))
+	}
+	return delay, nil
+}
+
 // Query within a namespace mapping and emit metrics. Returns fatal errors if
 // the scrape fails, and a slice of errors if they were non-fatal.
 func queryNamespaceMapping(ch chan<- prometheus.Metric, db *sql.DB, namespace string, mapping MetricMapNamespace) ([]error, error) {
@@ -302,6 +330,41 @@ func queryNamespaceMapping(ch chan<- prometheus.Metric, db *sql.DB, namespace st
 	}
 
 	nonfatalErrors := []error{}
+
+	//Retrive replication_delay for "pool_backend_stats"
+	if namespace == "pool_backend_stats" {
+		replicationDelay, err := calcReplicationDelay(db, namespace)
+		if err != nil {
+			return []error{}, errors.New(fmt.Sprintln("Error retrieving replication_delay:", namespace, err))
+		}
+
+		for rows.Next() {
+			err = rows.Scan(scanArgs...)
+			if err != nil {
+				return []error{}, errors.New(fmt.Sprintln("Error retrieving rows:", namespace, err))
+			}
+			var valueHostname string
+			for idx, columnName := range columnNames {
+				switch columnName {
+				case "hostname":
+					valueHostname, _ = dbToString(columnData[idx])
+					replication_delay, ok := replicationDelay[valueHostname]
+					if ok {
+						variableLabels := []string{"replication_delay"}
+						labels := []string{"replication_delay"}
+						ch <- prometheus.MustNewConstMetric(
+							prometheus.NewDesc(prometheus.BuildFQName("pgpool2", "", "test1"), "Replication Delay", variableLabels, nil),
+							prometheus.GaugeValue,
+							replication_delay,
+							labels...,
+						)
+					}
+
+				}
+			}
+
+		}
+	}
 
 	// Read from the result of "SHOW pool_pools"
 	if namespace == "pool_pools" {
@@ -535,8 +598,8 @@ func getDBConn(dsn string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	db.SetMaxOpenConns(2)
+	db.SetMaxIdleConns(2)
 
 	err = ping(db)
 	if err != nil {
