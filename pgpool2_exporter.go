@@ -23,6 +23,7 @@ SOFTWARE.
 package pgpool2_exporter
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -39,6 +40,7 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/promlog"
+	"google.golang.org/api/sqladmin/v1"
 	"gopkg.in/alecthomas/kingpin.v2"
 )
 
@@ -262,8 +264,26 @@ func NewExporter(dsn string, namespace string) *Exporter {
 	}
 }
 
+// retrive private IP of db
+func dbFindIP(dbInfo []string) (string, error) {
+	ctx := context.Background()
+	sqladminService, err := sqladmin.NewService(ctx)
+	if err != nil {
+		return "", errors.New(fmt.Sprintln("Error connetting to google SQL API", err))
+	}
+	instance, err := sqladminService.Instances.Get(dbInfo[0], dbInfo[1]).Do()
+	if err != nil {
+		return "", errors.New(fmt.Sprintln("Error retriving instance details", err))
+	}
+	ip := instance.IpAddresses[2].IpAddress
+
+	return ip, nil
+
+}
+
+// retrive replication_delay form primary
 func calcReplicationDelay(db *sql.DB, namespace string) (map[string]float64, error) {
-	query := "SELECT client_addr,replay_lag FROM pg_stat_replication;"
+	query := "SELECT application_name,replay_lag FROM pg_stat_replication;"
 	rows, err := db.Query(query)
 	if err != nil {
 		return nil, errors.New(fmt.Sprintln("Error running query on database: ", namespace, err))
@@ -272,12 +292,14 @@ func calcReplicationDelay(db *sql.DB, namespace string) (map[string]float64, err
 
 	delay := make(map[string]float64)
 	for rows.Next() {
-		var address string
+		var applicationName string
 		var replicationDelay string
-		err := rows.Scan(&address, &replicationDelay)
+		err := rows.Scan(&applicationName, &replicationDelay)
 		if err != nil {
 			return nil, errors.New(fmt.Sprintln("Error scanning rows: ", namespace, err))
 		}
+
+		dbInfo := strings.Split(applicationName, ":")
 
 		parts := strings.Split(replicationDelay, ":")
 		subParts := strings.Split(parts[2], ".")
@@ -290,7 +312,12 @@ func calcReplicationDelay(db *sql.DB, namespace string) (map[string]float64, err
 			msTotal += duration * multiplier
 		}
 
-		delay[address] = msTotal
+		dbIp, err := dbFindIP(dbInfo)
+		if err != nil {
+			return nil, errors.New(fmt.Sprintln("Error retriving db IP: ", namespace, err))
+		}
+
+		delay[dbIp] = msTotal
 	}
 	if err := rows.Err(); err != nil {
 		return nil, errors.New(fmt.Sprintln("Error iterating rows: ", namespace, err))
@@ -332,14 +359,23 @@ func queryNamespaceMapping(ch chan<- prometheus.Metric, db *sql.DB, namespace st
 	nonfatalErrors := []error{}
 
 	//Retrive replication_delay for "pool_backend_stats"
+
 	if namespace == "pool_backend_stats" {
 		replicationDelay, err := calcReplicationDelay(db, namespace)
 		if err != nil {
 			return []error{}, errors.New(fmt.Sprintln("Error retrieving replication_delay:", namespace, err))
 		}
+		query := fmt.Sprintf("SHOW %s;", namespace)
 
-		for rows.Next() {
-			err = rows.Scan(scanArgs...)
+		// Don't fail on a bad scrape of one metric
+		b_rows, err := db.Query(query)
+		if err != nil {
+			return []error{}, errors.New(fmt.Sprintln("Error running query on database: ", namespace, err))
+		}
+		defer b_rows.Close()
+
+		for b_rows.Next() {
+			err = b_rows.Scan(scanArgs...)
 			if err != nil {
 				return []error{}, errors.New(fmt.Sprintln("Error retrieving rows:", namespace, err))
 			}
@@ -350,10 +386,10 @@ func queryNamespaceMapping(ch chan<- prometheus.Metric, db *sql.DB, namespace st
 					valueHostname, _ = dbToString(columnData[idx])
 					replication_delay, ok := replicationDelay[valueHostname]
 					if ok {
-						variableLabels := []string{"replication_delay"}
-						labels := []string{"replication_delay"}
+						variableLabels := []string{"hostname"}
+						labels := []string{valueHostname}
 						ch <- prometheus.MustNewConstMetric(
-							prometheus.NewDesc(prometheus.BuildFQName("pgpool2", "", "test1"), "Replication Delay", variableLabels, nil),
+							prometheus.NewDesc(prometheus.BuildFQName("pgpool2", "pool", "replication_delay"), "Replication Delay in ms", variableLabels, nil),
 							prometheus.GaugeValue,
 							replication_delay,
 							labels...,
@@ -598,8 +634,8 @@ func getDBConn(dsn string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(2)
-	db.SetMaxIdleConns(2)
+	db.SetMaxOpenConns(3)
+	db.SetMaxIdleConns(3)
 
 	err = ping(db)
 	if err != nil {
