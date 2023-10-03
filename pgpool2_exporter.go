@@ -163,20 +163,22 @@ type Exporter struct {
 var (
 	metricMaps = map[string]map[string]ColumnMapping{
 		"pool_backend_stats": {
-			"hostname":          {LABEL, "Backend hostname"},
-			"port":              {LABEL, "Backend port"},
-			"role":              {LABEL, "Role (primary or standby)"},
-			"status":            {GAUGE, "Backend node Status (1 for up or waiting, 0 for down or unused)"},
-			"select_cnt":        {COUNTER, "SELECT statement counts issued to each backend"},
-			"insert_cnt":        {COUNTER, "INSERT statement counts issued to each backend"},
-			"update_cnt":        {COUNTER, "UPDATE statement counts issued to each backend"},
-			"delete_cnt":        {COUNTER, "DELETE statement counts issued to each backend"},
-			"ddl_cnt":           {COUNTER, "DDL statement counts issued to each backend"},
-			"other_cnt":         {COUNTER, "other statement counts issued to each backend"},
-			"panic_cnt":         {COUNTER, "Panic message counts returned from backend"},
-			"fatal_cnt":         {COUNTER, "Fatal message counts returned from backend)"},
-			"error_cnt":         {COUNTER, "Error message counts returned from backend"},
-			"replication_delay": {GAUGE, "Replication delay"},
+			"hostname":   {LABEL, "Backend hostname"},
+			"port":       {LABEL, "Backend port"},
+			"role":       {LABEL, "Role (primary or standby)"},
+			"status":     {GAUGE, "Backend node Status (1 for up or waiting, 0 for down or unused)"},
+			"select_cnt": {COUNTER, "SELECT statement counts issued to each backend"},
+			"insert_cnt": {COUNTER, "INSERT statement counts issued to each backend"},
+			"update_cnt": {COUNTER, "UPDATE statement counts issued to each backend"},
+			"delete_cnt": {COUNTER, "DELETE statement counts issued to each backend"},
+			"ddl_cnt":    {COUNTER, "DDL statement counts issued to each backend"},
+			"other_cnt":  {COUNTER, "other statement counts issued to each backend"},
+			"panic_cnt":  {COUNTER, "Panic message counts returned from backend"},
+			"fatal_cnt":  {COUNTER, "Fatal message counts returned from backend)"},
+			"error_cnt":  {COUNTER, "Error message counts returned from backend"},
+			"flush_lag":  {GAUGE, "flush delay"},
+			"write_lag":  {GAUGE, "write delay"},
+			"replay_lag": {GAUGE, "reply delay"},
 		},
 		"pool_health_check_stats": {
 			"hostname":            {LABEL, "Backend hostname"},
@@ -281,27 +283,11 @@ func dbFindIP(dbInfo []string) (string, error) {
 
 }
 
-// retrive replication_delay form primary
-func calcReplicationDelay(db *sql.DB, namespace string) (map[string]float64, error) {
-	query := "SELECT application_name,replay_lag FROM pg_stat_replication;"
-	rows, err := db.Query(query)
-	if err != nil {
-		return nil, errors.New(fmt.Sprintln("Error running query on database: ", namespace, err))
-	}
-	defer rows.Close()
-
-	delay := make(map[string]float64)
-	for rows.Next() {
-		var applicationName string
-		var replicationDelay string
-		err := rows.Scan(&applicationName, &replicationDelay)
-		if err != nil {
-			return nil, errors.New(fmt.Sprintln("Error scanning rows: ", namespace, err))
-		}
-
-		dbInfo := strings.Split(applicationName, ":")
-
-		parts := strings.Split(replicationDelay, ":")
+// transform replication delay in ms
+func retriveDelay(delayMap map[string]*string) (map[string]float64, error) {
+	dbInfo := make(map[string]float64)
+	for k, v := range delayMap {
+		parts := strings.Split(*v, ":")
 		subParts := strings.Split(parts[2], ".")
 		parts[2] = subParts[0]
 		parts = append(parts, subParts[1])
@@ -311,13 +297,50 @@ func calcReplicationDelay(db *sql.DB, namespace string) (map[string]float64, err
 			duration, _ := strconv.ParseFloat(part, 64)
 			msTotal += duration * multiplier
 		}
+		dbInfo[k] = msTotal
+	}
+	return dbInfo, nil
+}
+
+// retrive replication_delay form primary
+func calcReplicationDelay(db *sql.DB, namespace string) (map[string]map[string]float64, error) {
+	query := "SELECT application_name,write_lag,flush_lag,replay_lag FROM pg_stat_replication;"
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, errors.New(fmt.Sprintln("Error running query on database: ", namespace, err))
+	}
+	defer rows.Close()
+
+	delay := make(map[string]map[string]float64)
+	for rows.Next() {
+		var applicationName string
+
+		var writeDelayValue string
+		var flushDelayValue string
+		var replyDelayValue string
+		delayMap := map[string]*string{
+			"write_lag":  &writeDelayValue,
+			"flush_lag":  &flushDelayValue,
+			"replay_lag": &replyDelayValue,
+		}
+
+		err := rows.Scan(&applicationName, &writeDelayValue, &flushDelayValue, &replyDelayValue)
+		if err != nil {
+			return nil, errors.New(fmt.Sprintln("Error scanning rows: ", namespace, err))
+		}
+
+		dbInfo := strings.Split(applicationName, ":")
+		delayInfo, err := retriveDelay(delayMap)
+		if err != nil {
+			return nil, errors.New(fmt.Sprintln("Error Retriving delay info: ", namespace, err))
+		}
 
 		dbIp, err := dbFindIP(dbInfo)
 		if err != nil {
 			return nil, errors.New(fmt.Sprintln("Error retriving db IP: ", namespace, err))
 		}
 
-		delay[dbIp] = msTotal
+		delay[dbIp] = delayInfo
 	}
 	if err := rows.Err(); err != nil {
 		return nil, errors.New(fmt.Sprintln("Error iterating rows: ", namespace, err))
@@ -388,12 +411,14 @@ func queryNamespaceMapping(ch chan<- prometheus.Metric, db *sql.DB, namespace st
 					if ok {
 						variableLabels := []string{"hostname"}
 						labels := []string{valueHostname}
-						ch <- prometheus.MustNewConstMetric(
-							prometheus.NewDesc(prometheus.BuildFQName("pgpool2", "pool", "replication_delay"), "Replication Delay in ms", variableLabels, nil),
-							prometheus.GaugeValue,
-							replication_delay,
-							labels...,
-						)
+						for k, v := range replication_delay {
+							ch <- prometheus.MustNewConstMetric(
+								prometheus.NewDesc(prometheus.BuildFQName("pgpool2", "pool", k), k+" Delay in ms", variableLabels, nil),
+								prometheus.GaugeValue,
+								v,
+								labels...,
+							)
+						}
 					}
 
 				}
