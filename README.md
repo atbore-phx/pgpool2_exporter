@@ -22,7 +22,7 @@ The original version defines `pool_nodes` as follows:
 - `hostname`, `port`, `role`, `status`, `select_cnt` are considered redundant since they are already present in another metric called `pool_backend_stats`.
 
 - `replication_delay` is substituted with three new metrics, namely: `flush_lag`, `write_lag`, `replay_lag`,
-  which are obtained by inspecting the `pg_stat_replication`` table on the primary PostgreSQL instance.
+  which are obtained by inspecting the `pg_stat_replication` table on the primary PostgreSQL instance.
 
   the new `pool_backend_stats`:
 
