@@ -1,7 +1,7 @@
 This is a fork of pgpool/pgpool2_exporter, which utilizes gcloud SQL and the pg_stat_replication table to retrieve replication metrics.
 
 When pgpool is deployed in a cloud environment like gcloud (as implemented in this fork),
-replicas are often scaled up or down. If a node remains unused or goes down, the metric `pool_nodes`` will hang,
+replicas are often scaled up or down. If a node remains unused or goes down, the metric `pool_nodes` will hang,
 potentially causing the Prometheus scraping timeout to be reached.
 
 The original version defines `pool_nodes` as follows:
