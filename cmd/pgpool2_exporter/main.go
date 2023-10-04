@@ -3,8 +3,8 @@ package main
 import (
 	"fmt"
 	"net/http"
-	"os"
 	"net/url"
+	"os"
 
 	"github.com/go-kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
@@ -55,7 +55,10 @@ func main() {
 
 	http.Handle(*exp.MetricsPath, promhttp.Handler())
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(fmt.Sprintf(exp.LandingPage, *exp.MetricsPath)))
+		_, err = w.Write([]byte(fmt.Sprintf(exp.LandingPage, *exp.MetricsPath)))
+		if err != nil {
+			level.Error(exp.Logger).Log("err", err)
+		}
 	})
 
 	if err := http.ListenAndServe(*exp.ListenAddress, nil); err != nil {

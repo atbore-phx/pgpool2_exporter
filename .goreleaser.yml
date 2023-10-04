@@ -1,0 +1,22 @@
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: "pgpool2_exporter"
+    binary: pgpool2_exporter
+    main: ./cmd/pgpool2_exporter/main.go
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -a
+    tags:
+      - netgo
+      - static_build
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
